@@ -6,6 +6,14 @@ import { format, startOfDay, endOfDay } from "date-fns";
 import { es } from "date-fns/locale";
 import { prisma } from "@/lib/prisma";
 
+/** UTC offset in minutes for an IANA timezone at the current moment */
+function clinicTzOffset(tz: string): number {
+  const at = new Date();
+  const utc = at.toLocaleString("en-US", { timeZone: "UTC" });
+  const local = at.toLocaleString("en-US", { timeZone: tz });
+  return (new Date(local).getTime() - new Date(utc).getTime()) / 60000;
+}
+
 export default async function CalendarPage({
   searchParams,
 }: {
@@ -25,11 +33,12 @@ export default async function CalendarPage({
     getPatients(session.clinicId),
     prisma.clinic.findUnique({
       where: { id: session.clinicId },
-      select: { waPhoneNumberId: true, waActive: true },
+      select: { waPhoneNumberId: true, waActive: true, timezone: true } as const,
     }),
   ]);
 
   const canNotifyWhatsapp = !!(clinic?.waActive && clinic?.waPhoneNumberId);
+  const tzOffsetMin = clinicTzOffset(clinic?.timezone ?? "Europe/Madrid");
 
   return (
     <div className="space-y-4 h-full flex flex-col">
@@ -72,6 +81,7 @@ export default async function CalendarPage({
         }))}
         canNotifyWhatsapp={canNotifyWhatsapp}
         currentDate={dateParam.toISOString()}
+        clinicTzOffsetMin={tzOffsetMin}
       />
     </div>
   );

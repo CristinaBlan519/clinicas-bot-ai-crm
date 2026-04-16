@@ -101,6 +101,7 @@ async function handleMessage(
     phone: string | null;
     address: string | null;
     apiKey: string;
+    timezone: string;
     waPhoneNumberId: string | null;
     waBotName: string | null;
     waBotWelcome: string | null;
@@ -142,6 +143,7 @@ async function handleMessage(
     apiKey: clinic.apiKey,
     waBotName: clinic.waBotName,
     waBotWelcome: clinic.waBotWelcome,
+    timezone: clinic.timezone,
   };
 
   const { reply, updatedHistory } = await runBot(clinicCtx, history, text);

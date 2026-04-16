@@ -7,7 +7,9 @@
       "Bash(npx tsc:*)",
       "Bash(npx next:*)",
       "Bash(rm lib/360dialog.ts)",
-      "Bash(rm -rf app/api/callback/360dialog)"
+      "Bash(rm -rf app/api/callback/360dialog)",
+      "Bash(node -e \"const p=require\\(''./package.json''\\); console.log\\(''next:'', p.dependencies.next, ''react:'', p.dependencies.react\\)\")",
+      "Bash(xargs grep:*)"
     ]
   }
 }

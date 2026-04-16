@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useActionState, useEffect } from "react";
+import { useState, useActionState, useEffect, useTransition } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { format, addDays, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
@@ -12,7 +12,7 @@ import {
   Stethoscope,
   Loader2,
 } from "lucide-react";
-import { createAppointment, updateAppointment } from "@/app/actions/appointments";
+import { createAppointment, updateAppointment, cancelAppointment } from "@/app/actions/appointments";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -52,11 +52,20 @@ const SLOT_HEIGHT = 64; // px per hour
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** ISO → "YYYY-MM-DDTHH:mm" in local time (for datetime-local inputs) */
-function toDatetimeLocal(isoStr: string): string {
-  const d = new Date(isoStr);
+/**
+ * Shift a UTC date by the clinic's UTC offset so that getUTC* fields
+ * return the clinic-local time.
+ * e.g. 11:00 UTC + clinicTzOffsetMin=+120 → fake Date whose getUTCHours()=13
+ */
+function toClinicLocal(utcDate: Date, clinicTzOffsetMin: number): Date {
+  return new Date(utcDate.getTime() + clinicTzOffsetMin * 60000);
+}
+
+/** ISO → "YYYY-MM-DDTHH:mm" in clinic timezone (for datetime-local inputs) */
+function toDatetimeLocal(isoStr: string, clinicTzOffsetMin: number): string {
+  const d = toClinicLocal(new Date(isoStr), clinicTzOffsetMin);
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
 
 function add30min(dtLocal: string): string {
@@ -66,12 +75,12 @@ function add30min(dtLocal: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function aptStyle(apt: Appointment) {
-  const start = new Date(apt.startTime);
+function aptStyle(apt: Appointment, clinicTzOffsetMin: number) {
+  const start = toClinicLocal(new Date(apt.startTime), clinicTzOffsetMin);
   const end = new Date(apt.endTime);
   const startMinutes =
-    start.getHours() * 60 + start.getMinutes() - HOURS[0] * 60;
-  const durationMinutes = (end.getTime() - start.getTime()) / 60000;
+    start.getUTCHours() * 60 + start.getUTCMinutes() - HOURS[0] * 60;
+  const durationMinutes = (end.getTime() - new Date(apt.startTime).getTime()) / 60000;
   return {
     top: (startMinutes / 60) * SLOT_HEIGHT,
     height: Math.max((durationMinutes / 60) * SLOT_HEIGHT, 28),
@@ -264,19 +273,39 @@ function CreateModal({
 function EditModal({
   apt,
   canNotifyWhatsapp,
+  clinicTzOffsetMin,
   onClose,
 }: {
   apt: Appointment;
   canNotifyWhatsapp: boolean;
+  clinicTzOffsetMin: number;
   onClose: () => void;
 }) {
   const [result, action, pending] = useActionState(updateAppointment, null);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [cancelPending, startCancelTransition] = useTransition();
+  const router = useRouter();
   useEscKey(onClose);
 
   useEffect(() => {
     if (result && "success" in result) setTimeout(onClose, 700);
   }, [result]);
+
+  function handleCancel() {
+    const fd = new FormData();
+    fd.append("id", apt.id);
+    if (canNotifyWhatsapp) fd.append("notifyPatient", "true");
+    startCancelTransition(async () => {
+      const res = await cancelAppointment(null, fd);
+      if ("error" in res) {
+        setCancelError(res.error);
+      } else {
+        router.refresh();
+        onClose();
+      }
+    });
+  }
 
   return (
     <div
@@ -353,7 +382,7 @@ function EditModal({
                 type="datetime-local"
                 name="startTime"
                 required
-                defaultValue={toDatetimeLocal(apt.startTime)}
+                defaultValue={toDatetimeLocal(apt.startTime, clinicTzOffsetMin)}
                 className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-300"
               />
             </div>
@@ -365,7 +394,7 @@ function EditModal({
                 type="datetime-local"
                 name="endTime"
                 required
-                defaultValue={toDatetimeLocal(apt.endTime)}
+                defaultValue={toDatetimeLocal(apt.endTime, clinicTzOffsetMin)}
                 className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-300"
               />
             </div>
@@ -473,22 +502,19 @@ function EditModal({
                 ? "Se enviará una notificación al paciente por WhatsApp."
                 : "Esta acción no se puede deshacer."}
             </p>
-            <form action={action} className="flex gap-2">
-              <input type="hidden" name="id" value={apt.id} />
-              <input type="hidden" name="service" value={apt.service} />
-              <input type="hidden" name="startTime" value={toDatetimeLocal(apt.startTime)} />
-              <input type="hidden" name="endTime" value={toDatetimeLocal(apt.endTime)} />
-              <input type="hidden" name="price" value={apt.price} />
-              <input type="hidden" name="status" value="CANCELLED" />
-              {canNotifyWhatsapp && (
-                <input type="hidden" name="notifyPatient" value="true" />
-              )}
+            {cancelError && (
+              <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3">
+                {cancelError}
+              </p>
+            )}
+            <div className="flex gap-2">
               <button
-                type="submit"
-                disabled={pending}
+                type="button"
+                disabled={cancelPending}
+                onClick={handleCancel}
                 className="flex-1 flex items-center justify-center bg-red-500 hover:bg-red-600 text-white text-sm font-semibold py-2 rounded-xl transition-colors disabled:opacity-60"
               >
-                {pending ? (
+                {cancelPending ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
                 ) : canNotifyWhatsapp ? (
                   "Sí, cancelar y notificar"
@@ -503,7 +529,7 @@ function EditModal({
               >
                 No
               </button>
-            </form>
+            </div>
           </div>
         )}
       </div>
@@ -519,12 +545,14 @@ export function CalendarGrid({
   patients,
   canNotifyWhatsapp,
   currentDate,
+  clinicTzOffsetMin,
 }: {
   doctors: Doctor[];
   appointments: Appointment[];
   patients: Patient[];
   canNotifyWhatsapp: boolean;
   currentDate: string;
+  clinicTzOffsetMin: number;
 }) {
   const [editing, setEditing] = useState<Appointment | null>(null);
   const [creating, setCreating] = useState<CreateState | null>(null);
@@ -673,7 +701,7 @@ export function CalendarGrid({
 
                     {/* Appointments */}
                     {docApts.map((apt) => {
-                      const { top, height } = aptStyle(apt);
+                      const { top, height } = aptStyle(apt, clinicTzOffsetMin);
                       return (
                         <button
                           key={apt.id}
@@ -724,6 +752,7 @@ export function CalendarGrid({
         <EditModal
           apt={editing}
           canNotifyWhatsapp={canNotifyWhatsapp}
+          clinicTzOffsetMin={clinicTzOffsetMin}
           onClose={() => setEditing(null)}
         />
       )}

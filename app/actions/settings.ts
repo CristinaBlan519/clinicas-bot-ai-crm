@@ -18,12 +18,13 @@ export async function updateClinic(
   const name = (formData.get("name") as string)?.trim();
   const phone = (formData.get("phone") as string)?.trim() || null;
   const address = (formData.get("address") as string)?.trim() || null;
+  const timezone = (formData.get("timezone") as string)?.trim() || "Europe/Madrid";
 
   if (!name) return { error: "El nombre de la clínica es obligatorio." };
 
   await prisma.clinic.update({
     where: { id: session.clinicId },
-    data: { name, phone, address },
+    data: { name, phone, address, timezone },
   });
 
   // Refresh session cookie with updated clinic name

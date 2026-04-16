@@ -26,7 +26,43 @@ export interface ClinicContext {
   apiKey: string;
   waBotName: string | null;
   waBotWelcome: string | null;
+  timezone: string;
   knowledgeBase?: Array<{ question: string; answer: string; category: string | null }>;
+}
+
+// ─── Timezone utilities (no extra deps — uses built-in Intl) ──────────────────
+
+/** UTC offset in minutes for an IANA timezone at a given moment (handles DST) */
+function tzOffsetMin(tz: string, at = new Date()): number {
+  const utc = at.toLocaleString("en-US", { timeZone: "UTC" });
+  const local = at.toLocaleString("en-US", { timeZone: tz });
+  return (new Date(local).getTime() - new Date(utc).getTime()) / 60000;
+}
+
+/** "+HH:MM" / "-HH:MM" string for a given offset in minutes */
+function fmtTzOffset(offsetMin: number): string {
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const h = String(Math.floor(Math.abs(offsetMin) / 60)).padStart(2, "0");
+  const m = String(Math.abs(offsetMin) % 60).padStart(2, "0");
+  return `${sign}${h}:${m}`;
+}
+
+/**
+ * Returns a "fake UTC" Date whose UTC fields equal the local fields in `tz`.
+ * E.g. for a UTC Date of 11:00 UTC and tz=Europe/Madrid (+2):
+ *   result.getUTCHours() === 13  (Madrid local time)
+ */
+function toTzDate(utcDate: Date, tz: string): Date {
+  return new Date(utcDate.getTime() + tzOffsetMin(tz, utcDate) * 60000);
+}
+
+/** UTC midnight of the clinic-local date `dateStr` (YYYY-MM-DD) */
+function tzMidnightUTC(dateStr: string, tz: string): Date {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  // Start with UTC midnight of that date, then subtract the tz offset
+  const utcMidnight = Date.UTC(y, m - 1, d, 0, 0, 0);
+  const probe = new Date(utcMidnight);
+  return new Date(utcMidnight - tzOffsetMin(tz, probe) * 60000);
 }
 
 export interface BotMessage {
@@ -69,15 +105,10 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "listar_medicos",
     description:
-      "Lista los médicos disponibles en la clínica con sus especialidades.",
+      "Lista TODOS los médicos disponibles en la clínica con sus especialidades. No filtrés por especialidad — siempre traé la lista completa y luego identificá cuál corresponde a lo que pide el paciente.",
     input_schema: {
       type: "object" as const,
-      properties: {
-        specialty: {
-          type: "string",
-          description: "Filtrar por especialidad (opcional)",
-        },
-      },
+      properties: {},
     },
   },
   {
@@ -158,7 +189,8 @@ const TOOLS: Anthropic.Tool[] = [
 async function executeTool(
   name: string,
   input: Record<string, string>,
-  clinicId: string
+  clinicId: string,
+  tz: string
 ): Promise<unknown> {
   switch (name) {
     case "buscar_paciente": {
@@ -194,12 +226,7 @@ async function executeTool(
 
     case "listar_medicos": {
       const doctors = await prisma.doctor.findMany({
-        where: {
-          clinicId,
-          ...(input.specialty
-            ? { specialty: { contains: input.specialty, mode: "insensitive" } }
-            : {}),
-        },
+        where: { clinicId },
         include: { availability: { orderBy: { dayOfWeek: "asc" } } },
         orderBy: { name: "asc" },
       });
@@ -216,10 +243,10 @@ async function executeTool(
     }
 
     case "verificar_disponibilidad": {
-      const [year, month, day] = input.date.split("-").map(Number);
-      const dayStart = new Date(year, month - 1, day, 0, 0, 0);
-      const dayEnd = new Date(year, month - 1, day, 23, 59, 59);
-      const dayOfWeek = dayStart.getDay();
+      // All date operations use the clinic timezone
+      const dayStart = tzMidnightUTC(input.date, tz);
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000 - 1);
+      const dayOfWeek = toTzDate(dayStart, tz).getUTCDay();
 
       const doctor = await prisma.doctor.findFirst({
         where: { id: input.doctorId, clinicId },
@@ -246,8 +273,9 @@ async function executeTool(
 
       const [startH, startM] = avail.startTime.split(":").map(Number);
       const [endH, endM] = avail.endTime.split(":").map(Number);
-      const windowStart = new Date(year, month - 1, day, startH, startM);
-      const windowEnd = new Date(year, month - 1, day, endH, endM);
+      // windowStart/End are UTC times corresponding to clinic-local working hours
+      const windowStart = new Date(dayStart.getTime() + (startH * 60 + startM) * 60000);
+      const windowEnd = new Date(dayStart.getTime() + (endH * 60 + endM) * 60000);
 
       const freeSlots: string[] = [];
       let cursor = new Date(windowStart);
@@ -262,9 +290,11 @@ async function executeTool(
         );
 
         if (!busy) {
+          // Display time in clinic timezone
+          const local = toTzDate(cursor, tz);
           freeSlots.push(
-            `${cursor.getHours().toString().padStart(2, "0")}:${cursor
-              .getMinutes()
+            `${local.getUTCHours().toString().padStart(2, "0")}:${local
+              .getUTCMinutes()
               .toString()
               .padStart(2, "0")}`
           );
@@ -285,17 +315,23 @@ async function executeTool(
       const startTime = new Date(input.startTime);
       const endTime = new Date(input.endTime);
 
+      // Convert to clinic timezone for day-of-week and time validation
+      const startLocal = toTzDate(startTime, tz);
+
       // Verify doctor availability
       const avail = await prisma.doctorAvailability.findFirst({
-        where: { doctorId: input.doctorId, dayOfWeek: startTime.getDay() },
+        where: { doctorId: input.doctorId, dayOfWeek: startLocal.getUTCDay() },
       });
 
       if (!avail) {
         return { success: false, error: "El médico no trabaja ese día" };
       }
 
-      const toHHMM = (d: Date) =>
-        `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+      // Compare times in clinic timezone using UTC fields of the shifted date
+      const toHHMM = (d: Date) => {
+        const local = toTzDate(d, tz);
+        return `${local.getUTCHours().toString().padStart(2, "0")}:${local.getUTCMinutes().toString().padStart(2, "0")}`;
+      };
 
       if (toHHMM(startTime) < avail.startTime || toHHMM(endTime) > avail.endTime) {
         return {
@@ -410,21 +446,18 @@ async function executeTool(
       const results: Array<{ date: string; dayName: string; freeSlots: string[] }> = [];
 
       for (let i = 1; i <= dias; i++) {
-        const date = addDays(new Date(), i);
-        const dayOfWeek = date.getDay();
+        const nowUtc = new Date();
+        const futureDateStr = format(addDays(toTzDate(nowUtc, tz), i), "yyyy-MM-dd");
+        const dayStart = tzMidnightUTC(futureDateStr, tz);
+        const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000 - 1);
+        const dayOfWeek = toTzDate(dayStart, tz).getUTCDay();
         if (!availableDays.includes(dayOfWeek)) continue;
 
         const avail = doctor.availability.find((a) => a.dayOfWeek === dayOfWeek)!;
         const [startH, startM] = avail.startTime.split(":").map(Number);
         const [endH, endM] = avail.endTime.split(":").map(Number);
-
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        const day = date.getDate();
-        const windowStart = new Date(year, month, day, startH, startM);
-        const windowEnd = new Date(year, month, day, endH, endM);
-        const dayStart = new Date(year, month, day, 0, 0, 0);
-        const dayEnd = new Date(year, month, day, 23, 59, 59);
+        const windowStart = new Date(dayStart.getTime() + (startH * 60 + startM) * 60000);
+        const windowEnd = new Date(dayStart.getTime() + (endH * 60 + endM) * 60000);
 
         const existing = await prisma.appointment.findMany({
           where: {
@@ -445,8 +478,9 @@ async function executeTool(
             (apt) => cursor < new Date(apt.endTime) && slotEnd > new Date(apt.startTime)
           );
           if (!busy) {
+            const local = toTzDate(cursor, tz);
             freeSlots.push(
-              `${cursor.getHours().toString().padStart(2, "0")}:${cursor.getMinutes().toString().padStart(2, "0")}`
+              `${local.getUTCHours().toString().padStart(2, "0")}:${local.getUTCMinutes().toString().padStart(2, "0")}`
             );
           }
           cursor = slotEnd;
@@ -454,8 +488,8 @@ async function executeTool(
 
         if (freeSlots.length > 0) {
           results.push({
-            date: format(date, "yyyy-MM-dd"),
-            dayName: format(date, "EEEE d 'de' MMMM", { locale: es }),
+            date: futureDateStr,
+            dayName: format(toTzDate(dayStart, tz), "EEEE d 'de' MMMM", { locale: es }),
             freeSlots,
           });
           if (results.length >= 3) break; // devolver los primeros 3 días con disponibilidad
@@ -481,7 +515,11 @@ async function executeTool(
 
 function buildSystemPrompt(clinic: ClinicContext): string {
   const botName = clinic.waBotName ?? `Asistente de ${clinic.name}`;
-  const now = format(new Date(), "EEEE d 'de' MMMM 'de' yyyy, HH:mm", {
+  const offsetMin = tzOffsetMin(clinic.timezone);
+  const tzStr = fmtTzOffset(offsetMin);
+  // "now" in the clinic's local timezone
+  const nowLocal = toTzDate(new Date(), clinic.timezone);
+  const now = format(nowLocal, "EEEE d 'de' MMMM 'de' yyyy, HH:mm", {
     locale: es,
   });
 
@@ -492,7 +530,7 @@ INFORMACIÓN DE LA CLÍNICA:
 - Nombre: ${clinic.name}
 ${clinic.address ? `- Dirección: ${clinic.address}` : ""}
 ${clinic.phone ? `- Teléfono: ${clinic.phone}` : ""}
-- Fecha y hora actual: ${now}
+- Fecha y hora actual: ${now} (zona horaria del servidor: UTC${tzStr})
 
 REGLAS DE COMPORTAMIENTO:
 - Nunca mostrés menús numerados ni listas de opciones tipo "1. Sacar turno, 2. Cancelar turno"
@@ -513,7 +551,9 @@ REGLAS ESTRICTAS DE USO DE HERRAMIENTAS — NUNCA ADIVINES, SIEMPRE CONSULTÁ:
 - Cuando el paciente pregunta "¿qué días trabaja?" o "¿cuándo tiene disponibilidad?", llamá buscar_proxima_disponibilidad y mostrá las fechas reales con los horarios libres
 - Los workingDays que devuelve listar_medicos son los días configurados, pero puede haber turnos ocupados — siempre verificá con verificar_disponibilidad o buscar_proxima_disponibilidad antes de confirmar disponibilidad
 - Cuando listés médicos, mostrá su especialidad y sus días de trabajo (workingDays del resultado)
+- Cuando el paciente pide un especialista (ej: "ginecólogo", "cardiólogo"), SIEMPRE llamá listar_medicos sin filtro, leé la lista completa y buscá el médico cuya especialidad coincida semánticamente — las especialidades en la DB están en español y en forma sustantiva (ej: "Ginecologia"), nunca rechaces sin antes consultar la lista completa
 - Para crear un turno: el endTime es siempre 30 minutos después del startTime
+- SIEMPRE incluí la zona horaria del servidor en los ISO 8601 de startTime y endTime, ej: 2026-04-15T14:00:00${tzStr}. NUNCA omitas el offset de zona horaria
 
 ${
   clinic.knowledgeBase && clinic.knowledgeBase.length > 0
@@ -588,7 +628,8 @@ export async function runBot(
           const result = await executeTool(
             block.name,
             block.input as Record<string, string>,
-            clinic.id
+            clinic.id,
+            clinic.timezone
           );
           return {
             type: "tool_result" as const,

@@ -45,6 +45,7 @@ export default async function SettingsPage() {
               name: clinic.name,
               phone: clinic.phone ?? "",
               address: clinic.address ?? "",
+              timezone: clinic.timezone,
             }}
           />
 

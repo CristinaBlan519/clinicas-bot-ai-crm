@@ -162,6 +162,61 @@ export async function updateAppointment(
   };
 }
 
+// ─── Cancel ───────────────────────────────────────────────────────────────────
+
+export async function cancelAppointment(
+  _prev: ActionResult | null,
+  formData: FormData
+): Promise<ActionResult> {
+  const session = await getSession();
+  if (!session) return { error: "No autorizado" };
+
+  const id = formData.get("id") as string;
+  const notifyPatient = formData.get("notifyPatient") === "true";
+
+  if (!id) return { error: "ID requerido" };
+
+  const existing = await prisma.appointment.findFirst({
+    where: { id, clinicId: session.clinicId },
+    include: {
+      patient: { select: { name: true, phone: true } },
+      doctor: { select: { name: true } },
+    },
+  });
+  if (!existing) return { error: "Turno no encontrado" };
+
+  await prisma.appointment.update({
+    where: { id },
+    data: { status: "CANCELLED" as never },
+  });
+
+  if (notifyPatient && existing.patient.phone) {
+    try {
+      const clinic = await prisma.clinic.findUnique({
+        where: { id: session.clinicId },
+        select: { waPhoneNumberId: true, waActive: true },
+      });
+      if (clinic?.waActive && clinic.waPhoneNumberId) {
+        const { sendWhatsAppMessage } = await import("@/lib/twilio");
+        const { format } = await import("date-fns");
+        const { es } = await import("date-fns/locale");
+        const dateStr = format(existing.startTime, "EEEE d 'de' MMMM 'a las' HH:mm", { locale: es });
+        await sendWhatsAppMessage(
+          clinic.waPhoneNumberId,
+          existing.patient.phone,
+          `Hola ${existing.patient.name} 👋 Tu turno con ${existing.doctor.name} del ${dateStr} fue cancelado por la clínica. Si querés reprogramarlo, escribinos y te buscamos un nuevo horario.`
+        );
+      }
+    } catch (err) {
+      console.error("[appointments] WhatsApp notification failed:", err);
+    }
+  }
+
+  revalidatePath("/calendar");
+  revalidatePath("/");
+  return { success: "Turno cancelado" };
+}
+
 // ─── Simple status update (legacy, kept for compatibility) ────────────────────
 
 export async function updateAppointmentStatus(

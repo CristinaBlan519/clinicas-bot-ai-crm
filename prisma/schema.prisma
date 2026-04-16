@@ -19,6 +19,8 @@ model Clinic {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  timezone        String   @default("Europe/Madrid")
+
   // WhatsApp Bot (via Twilio)
   waPhoneNumberId String?  // Twilio number in E.164, e.g. "+14155238886"
   waBotName       String?
